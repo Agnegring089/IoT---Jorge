@@ -1,0 +1,329 @@
+export default {
+  async fetch(request, env) {
+    try {
+      const url = new URL(request.url);
+      const path = url.pathname.replace(/\/+$/, "") || "/";
+      const method = request.method.toUpperCase();
+
+      // ====== CORS ======
+      const corsOrigin = env.CORS_ORIGIN || "*";
+      if (method === "OPTIONS") {
+        return new Response(null, { status: 204, headers: corsHeaders(corsOrigin) });
+      }
+
+      // ====== Healthcheck ======
+      if (path === "/" && method === "GET") {
+        return json({ ok: true, service: "rfid-esp32-worker" }, 200, corsOrigin);
+      }
+
+      // ====== KV check ======
+      if (!env.kv_banco) {
+        return text("ERRO: Binding KV não encontrado (env.kv_banco)!", 500, corsOrigin);
+      }
+
+      // ====== Auth / flags ======
+      const reqKey = request.headers.get("x-api-key") || "";
+      const isAdmin = !!env.ADMIN_KEY && reqKey === env.ADMIN_KEY;
+      const autoBind = String(env.AUTO_BIND_FIRST_DEVICE || "") === "1";
+
+      // =========================
+      //          ROTAS
+      // =========================
+
+      // POST /register  -> { tagId, name, userId?, deviceId? }
+      // Se deviceId vier e a tag não tiver um, fixa. Se já tiver diferente, 409 (a menos que admin).
+      if (path === "/register" && method === "POST") {
+        const body = await safeJson(request);
+        if (!body.ok) return text("Erro no JSON recebido: " + body.err, 400, corsOrigin);
+
+        const { tagId, name, userId, deviceId } = body.data || {};
+        if (!tagId || !name) {
+          return json({ error: "tagId and name are required" }, 400, corsOrigin);
+        }
+
+        const key = `users:${tagId}`;
+        const raw = await env.kv_banco.get(key);
+        const now = isoNow();
+
+        let user = raw
+          ? JSON.parse(raw)
+          : {
+              tagId,
+              name,
+              userId: userId || null,
+              active: true,
+              createdAt: now,
+              updatedAt: now,
+              deviceId: undefined,
+            };
+
+        // atualiza campos básicos
+        user.name = name ?? user.name;
+        user.userId = userId ?? user.userId;
+        user.active = true;
+
+        // lógica de deviceId fixo
+        if (deviceId) {
+          if (!user.deviceId) {
+            user.deviceId = String(deviceId).trim();
+          } else if (user.deviceId !== String(deviceId).trim()) {
+            if (!isAdmin) {
+              return json(
+                { ok: false, error: "device_conflict", message: "deviceId já definido para esta tag", expected: user.deviceId, received: deviceId },
+                409,
+                corsOrigin
+              );
+            } else {
+              user.deviceId = String(deviceId).trim(); // override admin
+            }
+          }
+        }
+
+        user.updatedAt = now;
+        await env.kv_banco.put(key, JSON.stringify(user));
+        return json({ ok: true, user }, 200, corsOrigin);
+      }
+
+      // POST /scan -> { tagId, deviceId?, type?("entry"|"exit"|"scan"), meta? }
+      // Se user.deviceId existir, só aceita se bater. Se não existir:
+      //   - se AUTO_BIND_FIRST_DEVICE=1 e vier deviceId, fixa no primeiro scan
+      //   - senão, 409 device_not_bound
+      if (path === "/scan" && method === "POST") {
+        const body = await safeJson(request);
+        if (!body.ok) return text("Erro no JSON recebido: " + body.err, 400, corsOrigin);
+
+        const { tagId, deviceId, type, meta } = body.data || {};
+        if (!tagId) return json({ error: "tagId is required" }, 400, corsOrigin);
+
+        const eventType = type || "scan";
+        const ukey = `users:${tagId}`;
+        const raw = await env.kv_banco.get(ukey);
+
+        if (!raw) {
+          await logScan(env, tagId, eventType, deviceId, { ...(meta || {}), registered: false });
+          return json({ ok: false, registered: false, reason: "unknown_tag" }, 404, corsOrigin);
+        }
+
+        const user = JSON.parse(raw);
+        if (!user.active) {
+          await logScan(env, tagId, eventType, deviceId, { ...(meta || {}), registered: true, active: false });
+          return json({ ok: false, registered: true, active: false, reason: "user_inactive" }, 403, corsOrigin);
+        }
+
+        // Validação de device fixo
+        if (user.deviceId) {
+          if (!deviceId) {
+            await logScan(env, tagId, eventType, deviceId, { ...(meta || {}), allowed: false, reason: "device_required_for_bound_tag" });
+            return json({ ok: false, error: "device_required", message: "Envie deviceId para esta tag vinculada." }, 400, corsOrigin);
+          }
+          if (user.deviceId !== String(deviceId).trim()) {
+            await logScan(env, tagId, eventType, deviceId, { ...(meta || {}), allowed: false, reason: "wrong_device", expected: user.deviceId });
+            return json({ ok: false, error: "wrong_device", expected: user.deviceId, received: deviceId }, 401, corsOrigin);
+          }
+        } else {
+          // Sem deviceId fixo ainda
+          if (autoBind && deviceId) {
+            user.deviceId = String(deviceId).trim(); // amarra no primeiro uso
+          } else {
+            await logScan(env, tagId, eventType, deviceId, { ...(meta || {}), allowed: false, reason: "device_not_bound" });
+            return json({ ok: false, error: "device_not_bound", message: "Tag sem deviceId definido." }, 409, corsOrigin);
+          }
+        }
+
+        // Update user (last seen)
+        const now = isoNow();
+        user.lastSeenAt = now;
+        user.lastEvent = eventType;
+        user.updatedAt = now;
+        await env.kv_banco.put(ukey, JSON.stringify(user));
+
+        await logScan(env, tagId, eventType, deviceId, {
+          ...(meta || {}),
+          registered: true,
+          active: true,
+          allowed: true,
+          name: user.name,
+          userId: user.userId,
+        });
+
+        return json({ ok: true, user }, 200, corsOrigin);
+      }
+
+      // GET /user/:tagId  (opcionalmente valida ?deviceId=...)
+      if (path.startsWith("/user/") && method === "GET") {
+        const tagId = path.split("/").pop();
+        if (!tagId) return json({ error: "tagId param required" }, 400, corsOrigin);
+
+        const raw = await env.kv_banco.get(`users:${tagId}`);
+        if (!raw) return json({ ok: false, reason: "not_found" }, 404, corsOrigin);
+
+        const user = JSON.parse(raw);
+
+        const qDevice = (url.searchParams.get("deviceId") || "").trim();
+        if (qDevice && user.deviceId && user.deviceId !== qDevice) {
+          return json({ ok: false, error: "wrong_device", expected: user.deviceId, received: qDevice }, 401, corsOrigin);
+        }
+
+        return json({ ok: true, user }, 200, corsOrigin);
+      }
+
+      // PATCH /user/:tagId/bind-device  { deviceId }
+      // Define o deviceId se ainda não existir. Se já existir diferente:
+      //   - 409 (a menos que admin com x-api-key==ADMIN_KEY)
+      if (/^\/user\/[^/]+\/bind-device$/.test(path) && method === "PATCH") {
+        const tagId = path.split("/")[2];
+        const body = await safeJson(request);
+        if (!body.ok) return text("Erro no JSON recebido: " + body.err, 400, corsOrigin);
+
+        const { deviceId } = body.data || {};
+        if (!deviceId) return json({ error: "deviceId is required" }, 400, corsOrigin);
+
+        const key = `users:${tagId}`;
+        const raw = await env.kv_banco.get(key);
+        if (!raw) return json({ error: "not_found" }, 404, corsOrigin);
+
+        const user = JSON.parse(raw);
+        if (!user.deviceId) {
+          user.deviceId = String(deviceId).trim();
+        } else if (user.deviceId !== String(deviceId).trim()) {
+          if (!isAdmin) {
+            return json(
+              { ok: false, error: "device_conflict", expected: user.deviceId, received: deviceId },
+              409,
+              corsOrigin
+            );
+          } else {
+            user.deviceId = String(deviceId).trim(); // override admin
+          }
+        }
+        user.updatedAt = isoNow();
+        await env.kv_banco.put(key, JSON.stringify(user));
+        return json({ ok: true, user }, 200, corsOrigin);
+      }
+
+      // PATCH /user/:tagId/activate
+      if (/^\/user\/[^/]+\/activate$/.test(path) && method === "PATCH") {
+        const tagId = path.split("/")[2];
+        const key = `users:${tagId}`;
+        const raw = await env.kv_banco.get(key);
+        if (!raw) return json({ error: "not_found" }, 404, corsOrigin);
+        const user = JSON.parse(raw);
+        user.active = true;
+        user.updatedAt = isoNow();
+        await env.kv_banco.put(key, JSON.stringify(user));
+        return json({ ok: true, user }, 200, corsOrigin);
+      }
+
+      // PATCH /user/:tagId/deactivate
+      if (/^\/user\/[^/]+\/deactivate$/.test(path) && method === "PATCH") {
+        const tagId = path.split("/")[2];
+        const key = `users:${tagId}`;
+        const raw = await env.kv_banco.get(key);
+        if (!raw) return json({ error: "not_found" }, 404, corsOrigin);
+        const user = JSON.parse(raw);
+        user.active = false;
+        user.updatedAt = isoNow();
+        await env.kv_banco.put(key, JSON.stringify(user));
+        return json({ ok: true, user }, 200, corsOrigin);
+      }
+
+      // GET /users?limit=100&cursor=...
+      if (path === "/users" && method === "GET") {
+        const limit = clampInt(url.searchParams.get("limit"), 100, 1, 1000);
+        const cursor = url.searchParams.get("cursor") || undefined;
+        const list = await env.kv_banco.list({ prefix: "users:", limit, cursor });
+
+        const users = [];
+        for (const k of list.keys) {
+          const v = await env.kv_banco.get(k.name);
+          if (v) users.push(JSON.parse(v));
+        }
+
+        return json({ ok: true, count: users.length, cursor: list.cursor, users }, 200, corsOrigin);
+      }
+
+      // GET /scans?limit=100&cursor=...
+      if (path === "/scans" && method === "GET") {
+        const limit = clampInt(url.searchParams.get("limit"), 100, 1, 1000);
+        const cursor = url.searchParams.get("cursor") || undefined;
+        const list = await env.kv_banco.list({ prefix: "scans:", limit, cursor });
+
+        const scans = [];
+        for (const k of list.keys) {
+          const v = await env.kv_banco.get(k.name);
+          if (v) scans.push(JSON.parse(v));
+        }
+
+        return json({ ok: true, count: scans.length, cursor: list.cursor, scans }, 200, corsOrigin);
+      }
+
+      // Help
+      return text(
+        "Use:\n" +
+          "POST /register  {tagId,name,userId?,deviceId?}\n" +
+          "POST /scan      {tagId,deviceId?,type?,meta?}\n" +
+          "GET  /user/:tagId  (?deviceId=... valida)\n" +
+          "PATCH /user/:tagId/bind-device  {deviceId}\n" +
+          "PATCH /user/:tagId/activate | /user/:tagId/deactivate\n" +
+          "GET  /users?limit=100&cursor=...\n" +
+          "GET  /scans?limit=100&cursor=...\n",
+        200,
+        corsOrigin
+      );
+
+    } catch (e) {
+      return text("Erro inesperado: " + (e?.message || e), 500, (env && env.CORS_ORIGIN) || "*");
+    }
+  },
+};
+
+/* ===================== helpers ===================== */
+function corsHeaders(origin = "*") {
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-headers": "content-type, x-api-key",
+    "access-control-allow-methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+    "access-control-max-age": "86400",
+  };
+}
+function json(data, status = 200, corsOrigin = "*") {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      ...corsHeaders(corsOrigin),
+    },
+  });
+}
+function text(msg, status = 200, corsOrigin = "*") {
+  return new Response(msg, {
+    status,
+    headers: { "content-type": "text/plain; charset=utf-8", ...corsHeaders(corsOrigin) },
+  });
+}
+async function safeJson(request) {
+  try {
+    const d = await request.json();
+    return { ok: true, data: d };
+  } catch (e) {
+    return { ok: false, err: e?.message || String(e) };
+  }
+}
+function isoNow() { return new Date().toISOString(); }
+function clampInt(v, def, min, max) {
+  const n = parseInt(v || `${def}`, 10);
+  return isNaN(n) ? def : Math.max(min, Math.min(max, n));
+}
+async function logScan(env, tagId, type, deviceId, meta) {
+  const ts = isoNow();
+  const epoch = Date.now().toString().padStart(13, "0");
+  const key = `scans:${epoch}:${tagId}`;
+  const obj = { tagId, type, deviceId, meta, ts };
+
+  const ttl = env.SCANS_LOG_TTL_SECONDS ? parseInt(env.SCANS_LOG_TTL_SECONDS, 10) : 0;
+  if (ttl > 0) {
+    await env.kv_banco.put(key, JSON.stringify(obj), { expirationTtl: ttl });
+  } else {
+    await env.kv_banco.put(key, JSON.stringify(obj));
+  }
+}
